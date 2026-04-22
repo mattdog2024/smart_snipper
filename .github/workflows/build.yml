@@ -1,0 +1,44 @@
+name: 构建 SmartSnipper.exe
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest   # 必须在 Windows 上构建 Windows exe
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow pystray pyinstaller
+
+      - name: 用 PyInstaller 打包单文件 exe
+        run: |
+          pyinstaller --onefile --windowed --icon=app_icon.ico --name=SmartSnipper smart_snipper.py
+
+      - name: 上传 exe 为 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartSnipper-exe
+          path: dist/SmartSnipper.exe
+          retention-days: 30   # 保留 30 天
+
+      - name: 创建 Release（仅在打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SmartSnipper.exe
+          generate_release_notes: true

@@ -1,0 +1,20 @@
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地配置（不上传，每台电脑自己生成）
+config.json
+
+# 截图输出文件
+截图_*.png
+高亮截图_*.png
+
+# IDE
+.vscode/
+.idea/
