@@ -27,7 +27,7 @@ except:
 # 配置文件路径：使用 %APPDATA% 目录，打包成 exe 后也能持久保存
 # ─────────────────────────────────────────────────────────────────────────────
 def get_config_path():
-    """获取配置文件路径，存放在 %APPDATA%\SmartSnipper\ 目录下"""
+    """获取配置文件路径，存放在 %APPDATA%\\SmartSnipper\\ 目录下"""
     app_data = os.environ.get("APPDATA", os.path.expanduser("~"))
     config_dir = os.path.join(app_data, "SmartSnipper")
     os.makedirs(config_dir, exist_ok=True)
@@ -41,7 +41,7 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return {"hotkey_vk": 0x73, "hotkey_mod": 0}  # 默认 F4，无修饰键
+    return {"hotkey_vk": 0x53, "hotkey_mod": 0x4006}  # 默认 Ctrl+Shift+S，避开常见软件的 F4
 
 def save_config(cfg):
     config_path = get_config_path()
@@ -88,6 +88,10 @@ MOD_WIN      = 0x0008
 MOD_NOREPEAT = 0x4000  # 防止长按重复触发
 
 HOTKEY_ID = 1  # 热键 ID
+DEFAULT_HOTKEY_VK = 0x53  # S
+DEFAULT_HOTKEY_MOD = MOD_CTRL | MOD_SHIFT | MOD_NOREPEAT
+LEGACY_F4_VK = 0x73
+LEGACY_F4_MOD = MOD_NOREPEAT
 
 def parse_hotkey_string(hotkey_str):
     """
@@ -138,8 +142,8 @@ class HotkeyListener(threading.Thread):
         super().__init__(daemon=True)
         self.on_hotkey = on_hotkey_callback
         self._hwnd = None
-        self._mod = MOD_NOREPEAT
-        self._vk = 0x73  # 默认 F4
+        self._mod = DEFAULT_HOTKEY_MOD
+        self._vk = DEFAULT_HOTKEY_VK
         self._lock = threading.Lock()
         self._ready = threading.Event()
 
@@ -502,11 +506,17 @@ def main():
     apply_startup_config()
 
     config = load_config()
-    current_mod = config.get("hotkey_mod", MOD_NOREPEAT)
-    current_vk  = config.get("hotkey_vk", 0x73)  # 默认 F4
+    current_mod = config.get("hotkey_mod", DEFAULT_HOTKEY_MOD)
+    current_vk  = config.get("hotkey_vk", DEFAULT_HOTKEY_VK)
 
     # 确保 MOD_NOREPEAT 标志始终存在（防止长按重复截图）
     current_mod = (current_mod & ~MOD_NOREPEAT) | MOD_NOREPEAT
+    if current_vk == LEGACY_F4_VK and current_mod == LEGACY_F4_MOD:
+        current_mod = DEFAULT_HOTKEY_MOD
+        current_vk = DEFAULT_HOTKEY_VK
+        config["hotkey_mod"] = current_mod
+        config["hotkey_vk"] = current_vk
+        save_config(config)
 
     cmd_queue = queue.Queue()
 
@@ -556,7 +566,7 @@ def main():
 
         tk.Label(
             settings_root,
-            text="请输入新的快捷键\n(如: f4  /  ctrl+shift+a  /  alt+f2)",
+            text="请输入新的快捷键\n(推荐: ctrl+shift+s  /  ctrl+alt+a  /  alt+f2)",
             font=("Microsoft YaHei", 10), justify="center"
         ).pack(pady=12)
 
