@@ -1,3 +1,4 @@
 pillow
 pystray
+mss
 pyinstaller

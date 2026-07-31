@@ -13,6 +13,11 @@ import json
 from PIL import ImageGrab, ImageOps, ImageEnhance, ImageTk, Image, ImageDraw
 
 try:
+    import mss
+except ImportError:
+    mss = None
+
+try:
     import pystray
 except ImportError:
     pystray = None
@@ -41,7 +46,7 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return {"hotkey_vk": 0x53, "hotkey_mod": 0x4006}  # 默认 Ctrl+Shift+S，避开常见软件的 F4
+    return {"hotkey_vk": 0x71, "hotkey_mod": 0x4000}  # 默认 F2（系统级独占注册）
 
 def save_config(cfg):
     config_path = get_config_path()
@@ -88,8 +93,10 @@ MOD_WIN      = 0x0008
 MOD_NOREPEAT = 0x4000  # 防止长按重复触发
 
 HOTKEY_ID = 1  # 热键 ID
-DEFAULT_HOTKEY_VK = 0x53  # S
-DEFAULT_HOTKEY_MOD = MOD_CTRL | MOD_SHIFT | MOD_NOREPEAT
+DEFAULT_HOTKEY_VK = 0x71  # F2
+DEFAULT_HOTKEY_MOD = MOD_NOREPEAT
+OLD_DEFAULT_HOTKEY_VK = 0x53  # Ctrl+Shift+S
+OLD_DEFAULT_HOTKEY_MOD = MOD_CTRL | MOD_SHIFT | MOD_NOREPEAT
 LEGACY_F4_VK = 0x73
 LEGACY_F4_MOD = MOD_NOREPEAT
 
@@ -136,7 +143,8 @@ def hotkey_to_display_string(mod, vk):
 class HotkeyListener(threading.Thread):
     """
     在独立线程中运行 Windows 消息循环，监听系统级热键。
-    使用 RegisterHotKey / UnregisterHotKey，不依赖 keyboard 库。
+    普通组合键使用 RegisterHotKey；单键 F2 使用低级键盘钩子，
+    触发截图后吞掉按键，避免当前软件同时收到 F2。
     """
     def __init__(self, on_hotkey_callback):
         super().__init__(daemon=True)
@@ -146,14 +154,41 @@ class HotkeyListener(threading.Thread):
         self._vk = DEFAULT_HOTKEY_VK
         self._lock = threading.Lock()
         self._ready = threading.Event()
+        self._keyboard_hook = None
+        self._f2_down = False
 
     def run(self):
         WM_HOTKEY = 0x0312
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        WM_SYSKEYDOWN = 0x0104
+        WM_SYSKEYUP = 0x0105
+        WH_KEYBOARD_LL = 13
 
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
 
-        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t)
+        WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_size_t, ctypes.c_ssize_t
+        )
+        LOWLEVELKEYBOARDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
+        )
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, LOWLEVELKEYBOARDPROC, ctypes.c_void_p, ctypes.c_uint
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("vkCode", ctypes.c_uint),
+                ("scanCode", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("time", ctypes.c_uint),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
 
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_HOTKEY and wparam == HOTKEY_ID:
@@ -162,6 +197,30 @@ class HotkeyListener(threading.Thread):
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         wnd_proc_func = WNDPROC(wnd_proc)
+
+        def keyboard_proc(n_code, wparam, lparam):
+            if n_code >= 0:
+                key = ctypes.cast(
+                    lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)
+                ).contents
+                with self._lock:
+                    exclusive_f2 = (
+                        self._vk == DEFAULT_HOTKEY_VK
+                        and self._mod == DEFAULT_HOTKEY_MOD
+                    )
+                if exclusive_f2 and key.vkCode == DEFAULT_HOTKEY_VK:
+                    if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if not self._f2_down:
+                            self._f2_down = True
+                            self.on_hotkey()
+                    elif wparam in (WM_KEYUP, WM_SYSKEYUP):
+                        self._f2_down = False
+                    return 1
+            return user32.CallNextHookEx(
+                self._keyboard_hook, n_code, wparam, lparam
+            )
+
+        keyboard_proc_func = LOWLEVELKEYBOARDPROC(keyboard_proc)
 
         class WNDCLASSEX(ctypes.Structure):
             _fields_ = [
@@ -198,9 +257,12 @@ class HotkeyListener(threading.Thread):
         self._hwnd = hwnd
 
         with self._lock:
-            if self._vk:
+            if self._vk and not self._uses_exclusive_f2():
                 user32.RegisterHotKey(hwnd, HOTKEY_ID, self._mod, self._vk)
 
+        self._keyboard_hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, keyboard_proc_func, hinstance, 0
+        )
         self._ready.set()
 
         MSG = ctypes.wintypes.MSG
@@ -210,7 +272,12 @@ class HotkeyListener(threading.Thread):
             user32.DispatchMessageW(ctypes.byref(msg))
 
         user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+        if self._keyboard_hook:
+            user32.UnhookWindowsHookEx(self._keyboard_hook)
         user32.DestroyWindow(hwnd)
+
+    def _uses_exclusive_f2(self):
+        return self._vk == DEFAULT_HOTKEY_VK and self._mod == DEFAULT_HOTKEY_MOD
 
     def update_hotkey(self, mod, vk):
         """更新热键，线程安全"""
@@ -222,6 +289,8 @@ class HotkeyListener(threading.Thread):
             self._mod = mod
             self._vk = vk
             if self._hwnd and vk:
+                if self._uses_exclusive_f2():
+                    return bool(self._keyboard_hook)
                 result = user32.RegisterHotKey(self._hwnd, HOTKEY_ID, mod, vk)
                 return bool(result)
         return False
@@ -463,9 +532,24 @@ class SmartSnipper:
         self.root.destroy()
 
 
+def capture_screen():
+    """优先使用 mss 快速抓取全部显示器，失败时回退到 Pillow。"""
+    if mss is not None:
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[0]
+                shot = sct.grab(monitor)
+                return Image.frombytes(
+                    "RGB", shot.size, shot.bgra, "raw", "BGRX"
+                )
+        except Exception:
+            pass
+    return ImageGrab.grab(all_screens=True)
+
+
 def take_snip():
-    time.sleep(0.1)
-    screen_img = ImageGrab.grab(all_screens=True)
+    # 不再人为等待；按下快捷键后立即抓屏。
+    screen_img = capture_screen()
     root = tk.Tk()
     app = SmartSnipper(root, screen_img)
     root.focus_force()
@@ -511,7 +595,12 @@ def main():
 
     # 确保 MOD_NOREPEAT 标志始终存在（防止长按重复截图）
     current_mod = (current_mod & ~MOD_NOREPEAT) | MOD_NOREPEAT
-    if current_vk == LEGACY_F4_VK and current_mod == LEGACY_F4_MOD:
+    needs_f2_migration = (
+        (current_vk == LEGACY_F4_VK and current_mod == LEGACY_F4_MOD)
+        or
+        (current_vk == OLD_DEFAULT_HOTKEY_VK and current_mod == OLD_DEFAULT_HOTKEY_MOD)
+    )
+    if needs_f2_migration:
         current_mod = DEFAULT_HOTKEY_MOD
         current_vk = DEFAULT_HOTKEY_VK
         config["hotkey_mod"] = current_mod
@@ -566,7 +655,7 @@ def main():
 
         tk.Label(
             settings_root,
-            text="请输入新的快捷键\n(推荐: ctrl+shift+s  /  ctrl+alt+a  /  alt+f2)",
+            text="请输入新的快捷键\n(默认: f2；也支持 ctrl+shift+s / ctrl+alt+a)",
             font=("Microsoft YaHei", 10), justify="center"
         ).pack(pady=12)
 
@@ -620,7 +709,6 @@ def main():
                     try: cmd_queue.get_nowait()
                     except: pass
                 take_snip()
-                time.sleep(0.2)
                 for _ in range(cmd_queue.qsize()):
                     try: cmd_queue.get_nowait()
                     except: pass
