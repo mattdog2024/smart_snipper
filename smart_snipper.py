@@ -168,6 +168,13 @@ class HotkeyListener(threading.Thread):
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
 
+        # ctypes 默认把未声明的返回值当作 32 位 int。在 64 位 Windows 上，
+        # HWND/HHOOK/HINSTANCE 会因此被截断，导致热键窗口或键盘钩子失效。
+        kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+
         WNDPROC = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
             ctypes.c_size_t, ctypes.c_ssize_t
@@ -256,13 +263,18 @@ class HotkeyListener(threading.Thread):
         )
         self._hwnd = hwnd
 
-        with self._lock:
-            if self._vk and not self._uses_exclusive_f2():
-                user32.RegisterHotKey(hwnd, HOTKEY_ID, self._mod, self._vk)
-
         self._keyboard_hook = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, keyboard_proc_func, hinstance, 0
         )
+
+        # 如果独占钩子安装失败，自动回退到 RegisterHotKey。
+        # 回退模式不能吞掉前台软件的 F2，但必须保证截图仍然能够触发。
+        with self._lock:
+            if self._vk and not (
+                self._uses_exclusive_f2() and self._keyboard_hook
+            ):
+                user32.RegisterHotKey(hwnd, HOTKEY_ID, self._mod, self._vk)
+
         self._ready.set()
 
         MSG = ctypes.wintypes.MSG
@@ -289,8 +301,8 @@ class HotkeyListener(threading.Thread):
             self._mod = mod
             self._vk = vk
             if self._hwnd and vk:
-                if self._uses_exclusive_f2():
-                    return bool(self._keyboard_hook)
+                if self._uses_exclusive_f2() and self._keyboard_hook:
+                    return True
                 result = user32.RegisterHotKey(self._hwnd, HOTKEY_ID, mod, vk)
                 return bool(result)
         return False
