@@ -8,6 +8,7 @@ import tempfile
 import sys
 import winreg
 import ctypes
+from ctypes import wintypes
 import json
 
 from PIL import ImageGrab, ImageOps, ImageEnhance, ImageTk, Image, ImageDraw
@@ -93,6 +94,7 @@ MOD_WIN      = 0x0008
 MOD_NOREPEAT = 0x4000  # 防止长按重复触发
 
 HOTKEY_ID = 1  # 热键 ID
+WM_UPDATE_HOTKEY = 0x8001  # WM_APP + 1
 DEFAULT_HOTKEY_VK = 0x71  # F2
 DEFAULT_HOTKEY_MOD = MOD_NOREPEAT
 OLD_DEFAULT_HOTKEY_VK = 0x53  # Ctrl+Shift+S
@@ -154,6 +156,8 @@ class HotkeyListener(threading.Thread):
         self._vk = DEFAULT_HOTKEY_VK
         self._lock = threading.Lock()
         self._ready = threading.Event()
+        self._update_done = threading.Event()
+        self._update_result = False
         self._keyboard_hook = None
         self._f2_down = False
 
@@ -172,8 +176,23 @@ class HotkeyListener(threading.Thread):
         # HWND/HHOOK/HINSTANCE 会因此被截断，导致热键窗口或键盘钩子失效。
         kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
         kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ]
         user32.CreateWindowExW.restype = ctypes.c_void_p
         user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.RegisterHotKey.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint
+        ]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
+        ]
+        user32.PostMessageW.restype = wintypes.BOOL
 
         WNDPROC = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
@@ -200,6 +219,18 @@ class HotkeyListener(threading.Thread):
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_HOTKEY and wparam == HOTKEY_ID:
                 self.on_hotkey()
+                return 0
+            if msg == WM_UPDATE_HOTKEY:
+                user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+                with self._lock:
+                    use_hook = self._uses_exclusive_f2() and self._keyboard_hook
+                    if not self._vk or use_hook:
+                        self._update_result = True
+                    else:
+                        self._update_result = bool(user32.RegisterHotKey(
+                            hwnd, HOTKEY_ID, self._mod, self._vk
+                        ))
+                self._update_done.set()
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -277,7 +308,7 @@ class HotkeyListener(threading.Thread):
 
         self._ready.set()
 
-        MSG = ctypes.wintypes.MSG
+        MSG = wintypes.MSG
         msg = MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             user32.TranslateMessage(ctypes.byref(msg))
@@ -294,18 +325,21 @@ class HotkeyListener(threading.Thread):
     def update_hotkey(self, mod, vk):
         """更新热键，线程安全"""
         user32 = ctypes.windll.user32
-        self._ready.wait(timeout=3)
+        if not self._ready.wait(timeout=3):
+            return False
         with self._lock:
-            if self._hwnd:
-                user32.UnregisterHotKey(self._hwnd, HOTKEY_ID)
             self._mod = mod
             self._vk = vk
-            if self._hwnd and vk:
-                if self._uses_exclusive_f2() and self._keyboard_hook:
-                    return True
-                result = user32.RegisterHotKey(self._hwnd, HOTKEY_ID, mod, vk)
-                return bool(result)
-        return False
+            hwnd = self._hwnd
+            self._update_result = False
+            self._update_done.clear()
+        if not hwnd or not user32.PostMessageW(
+            hwnd, WM_UPDATE_HOTKEY, 0, 0
+        ):
+            return False
+        if not self._update_done.wait(timeout=3):
+            return False
+        return self._update_result
 
     def stop(self):
         user32 = ctypes.windll.user32
